@@ -1,25 +1,26 @@
-const BASE = import.meta.env.VITE_CONNECTOR_URL;
+const BASE = import.meta.env.VITE_CONNECTOR_URL as string;
 
-export async function syncUsers() {
-  const res = await fetch(`${BASE}/sync/users`, {
-    method: "POST",
-  });
+function ensureBase() {
+  if (!BASE) throw new Error("VITE_CONNECTOR_URL is not set");
+}
 
-  if (!res.ok) {
-    throw new Error(`Failed to sync users: ${res.status}`);
-  }
-
+export async function connectorStatus() {
+  ensureBase();
+  const res = await fetch(`${BASE}/status`, { method: "GET" });
+  if (!res.ok) throw new Error(`Status HTTP ${res.status}`);
   return res.json();
 }
 
-export async function syncLogs() {
-  const res = await fetch(`${BASE}/sync/logs`, {
-    method: "POST",
-  });
+export async function syncUsersFromDevice() {
+  ensureBase();
+  const res = await fetch(`${BASE}/sync/users`, { method: "POST" });
+  if (!res.ok) throw new Error(`Users HTTP ${res.status}`);
+  return res.json(); // { ok, count, users }
+}
 
-  if (!res.ok) {
-    throw new Error(`Failed to sync logs: ${res.status}`);
-  }
-
-  return res.json();
+export async function syncLogsFromDevice() {
+  ensureBase();
+  const res = await fetch(`${BASE}/sync/logs`, { method: "POST" });
+  if (!res.ok) throw new Error(`Logs HTTP ${res.status}`);
+  return res.json(); // { ok, count, logs }
 }

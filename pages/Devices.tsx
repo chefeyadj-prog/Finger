@@ -1,33 +1,71 @@
-
 import React, { useState, useEffect } from 'react';
-import { 
-  Plus, 
-  Cpu, 
-  RefreshCw, 
-  Trash2, 
+import {
+  Plus,
+  Cpu,
+  RefreshCw,
+  Trash2,
   Fingerprint,
   Users,
   Wifi,
   Loader2,
-  Database,
   Activity,
   Terminal,
   XCircle,
-  ArrowDownToLine,
   Hash,
   ShieldAlert,
   Lock
 } from 'lucide-react';
-import { BiometricDevice } from '../types';
+import { BiometricDevice, Employee, AttendanceRecord } from '../types';
 import { supabase } from '../supabaseClient';
+import { connectorStatus, syncUsersFromDevice, syncLogsFromDevice } from '../zkService';
 
 const ADMIN_PIN = "2025";
+
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// محاولات لاستخراج timestamp/userid من أي شكل جاي من zklib
+function extractLogTimestamp(log: any): Date | null {
+  const raw =
+    log?.timestamp ??
+    log?.time ??
+    log?.datetime ??
+    log?.dateTime ??
+    log?.date ??
+    log?.logTime;
+
+  if (!raw) return null;
+
+  const d = new Date(raw);
+  if (!isNaN(d.getTime())) return d;
+
+  // لو كان سترينج بصيغة مختلفة
+  try {
+    const dd = new Date(String(raw));
+    return isNaN(dd.getTime()) ? null : dd;
+  } catch {
+    return null;
+  }
+}
+
+function extractUserId(obj: any): string {
+  return String(
+    obj?.userid ??
+    obj?.userId ??
+    obj?.user_id ??
+    obj?.uid ??
+    obj?.id ??
+    obj?.cardno ??
+    ''
+  ).trim();
+}
 
 const Devices: React.FC = () => {
   const [devices, setDevices] = useState<BiometricDevice[]>([]);
   const [loading, setLoading] = useState(true);
   const [isAdding, setIsAdding] = useState(false);
-  const [syncingType, setSyncingType] = useState<{id: string, type: 'users' | 'fingerprints'} | null>(null);
+  const [syncingType, setSyncingType] = useState<{ id: string, type: 'users' | 'fingerprints' } | null>(null);
   const [pingingId, setPingingId] = useState<string | null>(null);
   const [pingLogs, setPingLogs] = useState<string[]>([]);
   const [showPingModal, setShowPingModal] = useState(false);
@@ -56,46 +94,92 @@ const Devices: React.FC = () => {
     fetchDevices();
   }, []);
 
+  // ✅ فحص اتصال حقيقي عبر الكونكتور
   const handleTestConnection = async (device: BiometricDevice) => {
     setPingingId(device.id);
     setPingLogs([]);
     setShowPingModal(true);
-    const steps = [
-      `بدء فحص الجهاز: ${device.name}...`,
-      `محاولة الوصول لعنوان IP: ${device.ip_address}...`,
-      `فحص المنفذ (Port): ${device.port}...`,
-      `إرسال طلب التحقق (Handshake Request)...`,
-      `تم التحقق من السيريال: ${device.serial_number}`,
-      `الاتصال ناجح! وقت الاستجابة: 12ms`
-    ];
-    for (const step of steps) {
-      setPingLogs(prev => [...prev, step]);
-      await new Promise(resolve => setTimeout(resolve, 600));
+
+    try {
+      setPingLogs(prev => [...prev, `بدء فحص الاتصال عبر Cloudflare Tunnel...`]);
+      await sleep(400);
+
+      setPingLogs(prev => [...prev, `طلب /status...`]);
+      const status = await connectorStatus();
+      await sleep(400);
+
+      if (status?.ok !== true && status?.connected !== true) {
+        throw new Error('الكونكتور لم يرجع حالة اتصال صحيحة.');
+      }
+
+      setPingLogs(prev => [...prev, `الكونكتور متصل ✅`]);
+      setPingLogs(prev => [...prev, `connected: ${String(status?.connected ?? true)}`]);
+
+      await supabase.from('devices').update({ status: 'online' }).eq('id', device.id);
+      setPingLogs(prev => [...prev, `تم تحديث حالة الجهاز إلى online ✅`]);
+    } catch (err: any) {
+      setPingLogs(prev => [...prev, `فشل الاتصال ❌: ${err.message}`]);
+      await supabase.from('devices').update({ status: 'offline' }).eq('id', device.id);
+    } finally {
+      await fetchDevices();
+      setPingingId(null);
     }
-    await supabase.from('devices').update({ status: 'online' }).eq('id', device.id);
-    fetchDevices();
-    setPingingId(null);
   };
 
+  // ✅ سحب موظفين حقيقيين + إدخال في employees بدون تكرار على fingerprint_id
   const handlePullEmployees = async (deviceId: string) => {
     setSyncingType({ id: deviceId, type: 'users' });
+
     try {
-      const countToImport = Math.floor(Math.random() * 2) + 1; 
-      const newEmployees = [];
-      for(let i=0; i < countToImport; i++) {
-        const uniqueId = Math.floor(Math.random() * 10000);
-        newEmployees.push({
-          name: `موظف جديد ${uniqueId}`,
-          department: 'الشؤون الإدارية',
-          position: 'موظف مستورد',
-          fingerprint_id: `FP-${uniqueId}`,
-          status: 'active'
-        });
+      const result = await syncUsersFromDevice();
+      const users = result?.users || [];
+      if (!Array.isArray(users) || users.length === 0) {
+        alert('⚠️ لم يتم العثور على موظفين في جهاز البصمة.');
+        return;
       }
-      const { error } = await supabase.from('employees').insert(newEmployees);
-      if (error) throw error;
-      await supabase.from('devices').update({ last_sync: new Date().toLocaleString('ar-EG') }).eq('id', deviceId);
-      alert(`✅ تم استيراد عدد (${countToImport}) موظف جديد من الجهاز بنجاح.`);
+
+      // تجهيز بيانات للإدخال حسب نوع Employee في مشروعك
+      const toInsert: Omit<Employee, 'id'>[] = users
+        .map((u: any) => {
+          const fp = extractUserId(u);
+          const name = String(u?.name ?? '').trim() || `User ${fp || ''}`.trim();
+          return {
+            name,
+            department: 'مستوردة من جهاز البصمة',
+            position: '—',
+            fingerprint_id: fp,
+            status: 'active'
+          };
+        })
+        .filter((e: any) => e.fingerprint_id); // لا ندخل بدون معرف
+
+      if (!toInsert.length) {
+        alert('⚠️ الموظفون المسترجعون لا يحتويون على userid صالح.');
+        return;
+      }
+
+      // منع التكرار: جلب الموجودين على fingerprint_id
+      const ids = toInsert.map(e => e.fingerprint_id);
+      const { data: existing, error: exErr } = await supabase
+        .from('employees')
+        .select('fingerprint_id')
+        .in('fingerprint_id', ids);
+
+      if (exErr) throw exErr;
+
+      const existingSet = new Set((existing || []).map((e: any) => String(e.fingerprint_id)));
+      const newOnes = toInsert.filter(e => !existingSet.has(String(e.fingerprint_id)));
+
+      if (newOnes.length) {
+        const { error } = await supabase.from('employees').insert(newOnes);
+        if (error) throw error;
+      }
+
+      await supabase.from('devices')
+        .update({ last_sync: new Date().toLocaleString('ar-EG') })
+        .eq('id', deviceId);
+
+      alert(`✅ تم استيراد (${newOnes.length}) موظف جديد. (إجمالي بالجهاز: ${users.length})`);
       fetchDevices();
     } catch (err: any) {
       alert('فشل الاستيراد: ' + err.message);
@@ -104,26 +188,92 @@ const Devices: React.FC = () => {
     }
   };
 
+  // ✅ سحب سجلات بصمة حقيقية + إدخال في attendance_logs مع منع تكرار عملي
   const handlePullFingerprints = async (deviceId: string) => {
     setSyncingType({ id: deviceId, type: 'fingerprints' });
+
     try {
-      const { data: employees } = await supabase.from('employees').select('id, name');
+      // نجيب الموظفين من قاعدة البيانات
+      const { data: employees, error: empErr } = await supabase
+        .from('employees')
+        .select('id, name, fingerprint_id');
+
+      if (empErr) throw empErr;
       if (!employees || employees.length === 0) {
-        alert('⚠️ لا يوجد موظفين مسجلين حالياً لسحب بصماتهم. قم بسحب الموظفين أولاً.');
+        alert('⚠️ لا يوجد موظفين مسجلين. قم بسحب الموظفين أولاً.');
         return;
       }
-      const today = new Date().toISOString().split('T')[0];
-      const logsToInsert = employees.map(emp => ({
-        employee_id: emp.id,
-        employee_name: emp.name,
-        date: today,
-        check_in: `08:${Math.floor(Math.random() * 30).toString().padStart(2, '0')}`,
-        status: Math.random() > 0.8 ? 'late' : 'present'
-      }));
-      const { error } = await supabase.from('attendance_logs').insert(logsToInsert);
+
+      const empByFp = new Map<string, { id: string; name: string }>();
+      for (const e of employees as any[]) {
+        empByFp.set(String(e.fingerprint_id), { id: e.id, name: e.name });
+      }
+
+      const result = await syncLogsFromDevice();
+      const logs = result?.logs || [];
+      if (!Array.isArray(logs) || logs.length === 0) {
+        alert('⚠️ لا توجد سجلات بصمة في الجهاز.');
+        return;
+      }
+
+      // نحولها لسجلات حسب AttendanceRecord
+      const rows: Omit<AttendanceRecord, 'id'>[] = [];
+      for (const l of logs as any[]) {
+        const fpId = extractUserId(l);
+        const emp = empByFp.get(fpId);
+        if (!emp) continue; // تجاهل سجل لا يطابق موظف عندك
+
+        const dt = extractLogTimestamp(l);
+        if (!dt) continue;
+
+        const date = dt.toISOString().slice(0, 10);
+        const check_in = dt.toTimeString().slice(0, 5);
+
+        rows.push({
+          employee_id: emp.id,
+          employee_name: emp.name,
+          date,
+          check_in,
+          status: 'present'
+        });
+      }
+
+      if (!rows.length) {
+        alert('⚠️ تم جلب سجلات لكن لا يوجد تطابق مع الموظفين (fingerprint_id).');
+        return;
+      }
+
+      // منع تكرار عملي:
+      // 1) نجمع تواريخ السجلات
+      const uniqueDates = Array.from(new Set(rows.map(r => r.date))).slice(0, 20);
+
+      // 2) نجيب الموجود في attendance_logs لهذه التواريخ فقط
+      const { data: existingLogs, error: exErr } = await supabase
+        .from('attendance_logs')
+        .select('employee_id, date, check_in')
+        .in('date', uniqueDates);
+
+      if (exErr) throw exErr;
+
+      const existingKey = new Set(
+        (existingLogs || []).map((x: any) => `${x.employee_id}__${x.date}__${x.check_in}`)
+      );
+
+      const newRows = rows.filter(r => !existingKey.has(`${r.employee_id}__${r.date}__${r.check_in}`));
+
+      if (!newRows.length) {
+        alert('✅ لا يوجد سجلات جديدة لإضافتها (كلها موجودة مسبقًا).');
+        return;
+      }
+
+      const { error } = await supabase.from('attendance_logs').insert(newRows);
       if (error) throw error;
-      await supabase.from('devices').update({ last_sync: new Date().toLocaleString('ar-EG') }).eq('id', deviceId);
-      alert(`✅ تم سحب وتحديث عدد (${logsToInsert.length}) سجل حضور بنجاح لهذا اليوم.`);
+
+      await supabase.from('devices')
+        .update({ last_sync: new Date().toLocaleString('ar-EG') })
+        .eq('id', deviceId);
+
+      alert(`✅ تم إضافة (${newRows.length}) سجل حضور جديد من الجهاز.`);
       fetchDevices();
     } catch (err: any) {
       alert('فشل سحب البصمات: ' + err.message);
@@ -177,7 +327,7 @@ const Devices: React.FC = () => {
           </h1>
           <p className="text-gray-500 text-sm mt-1">المزامنة الحية مع أجهزة ZKTeco.</p>
         </div>
-        <button 
+        <button
           onClick={() => setIsAdding(true)}
           className="bg-blue-600 text-white px-6 py-3 rounded-2xl font-bold flex items-center gap-2 hover:bg-blue-700 transition-all shadow-lg active:scale-95"
         >
@@ -190,21 +340,21 @@ const Devices: React.FC = () => {
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6">
             <div className="space-y-2">
               <label className="text-xs font-bold text-gray-400">اسم الجهاز</label>
-              <input value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} className="w-full p-4 bg-gray-50 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 text-right" placeholder="جهاز البوابة" />
+              <input value={formData.name} onChange={e => setFormData({ ...formData, name: e.target.value })} className="w-full p-4 bg-gray-50 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 text-right" placeholder="جهاز البوابة" />
             </div>
             <div className="space-y-2">
               <label className="text-xs font-bold text-gray-400">IP Address</label>
-              <input value={formData.ip} onChange={e => setFormData({...formData, ip: e.target.value})} className="w-full p-4 bg-gray-50 rounded-2xl outline-none font-mono" placeholder="192.168.X.X" />
+              <input value={formData.ip} onChange={e => setFormData({ ...formData, ip: e.target.value })} className="w-full p-4 bg-gray-50 rounded-2xl outline-none font-mono" placeholder="192.168.X.X" />
             </div>
             <div className="space-y-2 text-right">
               <label className="text-xs font-bold text-gray-400">المنفذ</label>
-              <input value={formData.port} onChange={e => setFormData({...formData, port: e.target.value})} className="w-full p-4 bg-gray-50 rounded-2xl outline-none" placeholder="4370" />
+              <input value={formData.port} onChange={e => setFormData({ ...formData, port: e.target.value })} className="w-full p-4 bg-gray-50 rounded-2xl outline-none" placeholder="4370" />
             </div>
             <div className="space-y-2 text-right">
               <label className="text-xs font-bold text-gray-400">الرقم التسلسلي (S/N)</label>
               <div className="relative">
                 <Hash className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-300" size={16} />
-                <input value={formData.serial_number} onChange={e => setFormData({...formData, serial_number: e.target.value})} className="w-full p-4 pl-10 bg-gray-50 rounded-2xl outline-none border-2 border-transparent focus:border-blue-200 focus:bg-white transition-all font-mono text-sm" placeholder="S/N..." />
+                <input value={formData.serial_number} onChange={e => setFormData({ ...formData, serial_number: e.target.value })} className="w-full p-4 pl-10 bg-gray-50 rounded-2xl outline-none border-2 border-transparent focus:border-blue-200 focus:bg-white transition-all font-mono text-sm" placeholder="S/N..." />
               </div>
             </div>
             <div className="flex items-end gap-3 lg:col-span-1">
@@ -223,7 +373,7 @@ const Devices: React.FC = () => {
             <div key={device.id} className="bg-white rounded-[2rem] shadow-sm border border-gray-100 overflow-hidden group hover:shadow-2xl hover:border-blue-200 transition-all duration-500">
               <div className="p-8 text-right">
                 <div className="flex justify-between items-start mb-6">
-                  <button 
+                  <button
                     onClick={() => handleTestConnection(device)}
                     className="p-3 bg-slate-50 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-2xl transition-all"
                   >
@@ -257,7 +407,7 @@ const Devices: React.FC = () => {
                 </div>
 
                 <div className="flex gap-4">
-                  <button 
+                  <button
                     onClick={() => handlePullEmployees(device.id)}
                     disabled={device.status !== 'online' || !!syncingType}
                     className={`flex-1 py-4 rounded-2xl text-sm font-bold flex items-center justify-center gap-2 transition-all
@@ -266,7 +416,8 @@ const Devices: React.FC = () => {
                     {syncingType?.id === device.id && syncingType.type === 'users' ? <Loader2 className="animate-spin" size={18} /> : <Users size={18} />}
                     <span>سحب الموظفين</span>
                   </button>
-                  <button 
+
+                  <button
                     onClick={() => handlePullFingerprints(device.id)}
                     disabled={device.status !== 'online' || !!syncingType}
                     className={`flex-1 py-4 rounded-2xl text-sm font-bold flex items-center justify-center gap-2 transition-all
@@ -299,7 +450,7 @@ const Devices: React.FC = () => {
             <div className="p-8">
               <div className="relative mb-6">
                 <Lock className="absolute right-4 top-1/2 -translate-y-1/2 text-gray-300" size={20} />
-                <input 
+                <input
                   type="password"
                   autoFocus
                   className="w-full p-4 pr-12 bg-gray-50 rounded-2xl border-2 text-center text-2xl font-black tracking-[1em] outline-none border-transparent focus:border-blue-500"

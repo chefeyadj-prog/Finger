@@ -25,7 +25,6 @@ function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// محاولات لاستخراج timestamp/userid من أي شكل جاي من zklib
 function extractLogTimestamp(log: any): Date | null {
   const raw =
     log?.timestamp ??
@@ -40,25 +39,12 @@ function extractLogTimestamp(log: any): Date | null {
   const d = new Date(raw);
   if (!isNaN(d.getTime())) return d;
 
-  // لو كان سترينج بصيغة مختلفة
   try {
     const dd = new Date(String(raw));
     return isNaN(dd.getTime()) ? null : dd;
   } catch {
     return null;
   }
-}
-
-function extractUserId(obj: any): string {
-  return String(
-    obj?.userid ??
-    obj?.userId ??
-    obj?.user_id ??
-    obj?.uid ??
-    obj?.id ??
-    obj?.cardno ??
-    ''
-  ).trim();
 }
 
 const Devices: React.FC = () => {
@@ -108,13 +94,13 @@ const Devices: React.FC = () => {
       const status = await connectorStatus();
       await sleep(400);
 
-      if (status?.ok !== true && status?.connected !== true) {
+      if (status?.connected !== true && status?.ok !== true) {
         throw new Error('الكونكتور لم يرجع حالة اتصال صحيحة.');
       }
 
       setPingLogs(prev => [...prev, `الكونكتور متصل ✅`]);
-      setPingLogs(prev => [...prev, `connected: ${String(status?.connected ?? true)}`]);
 
+      // تحديث حالة الجهاز محليًا (كمؤشر في UI)
       await supabase.from('devices').update({ status: 'online' }).eq('id', device.id);
       setPingLogs(prev => [...prev, `تم تحديث حالة الجهاز إلى online ✅`]);
     } catch (err: any) {
@@ -126,23 +112,25 @@ const Devices: React.FC = () => {
     }
   };
 
-  // ✅ سحب موظفين حقيقيين + إدخال في employees بدون تكرار على fingerprint_id
+  // ✅ سحب موظفين حقيقيين + إدخال في employees بدون تكرار
+  // عندك: user.uid = رقم داخلي، و userid = "100" .. إلخ
+  // نخزن fingerprint_id = user.uid عشان يطابق logs.id
   const handlePullEmployees = async (deviceId: string) => {
     setSyncingType({ id: deviceId, type: 'users' });
 
     try {
       const result = await syncUsersFromDevice();
       const users = result?.users || [];
+
       if (!Array.isArray(users) || users.length === 0) {
         alert('⚠️ لم يتم العثور على موظفين في جهاز البصمة.');
         return;
       }
 
-      // تجهيز بيانات للإدخال حسب نوع Employee في مشروعك
       const toInsert: Omit<Employee, 'id'>[] = users
         .map((u: any) => {
-          const fp = extractUserId(u);
-          const name = String(u?.name ?? '').trim() || `User ${fp || ''}`.trim();
+          const fp = String(u?.uid ?? '').trim();          // ✅ هنا المفتاح
+          const name = String(u?.name ?? '').trim() || `User ${fp}`.trim();
           return {
             name,
             department: 'مستوردة من جهاز البصمة',
@@ -151,14 +139,14 @@ const Devices: React.FC = () => {
             status: 'active'
           };
         })
-        .filter((e: any) => e.fingerprint_id); // لا ندخل بدون معرف
+        .filter(e => e.fingerprint_id);
 
       if (!toInsert.length) {
-        alert('⚠️ الموظفون المسترجعون لا يحتويون على userid صالح.');
+        alert('⚠️ المستخدمون المسترجعون لا يحتويون على uid صالح.');
         return;
       }
 
-      // منع التكرار: جلب الموجودين على fingerprint_id
+      // منع التكرار: fingerprint_id
       const ids = toInsert.map(e => e.fingerprint_id);
       const { data: existing, error: exErr } = await supabase
         .from('employees')
@@ -188,12 +176,13 @@ const Devices: React.FC = () => {
     }
   };
 
-  // ✅ سحب سجلات بصمة حقيقية + إدخال في attendance_logs مع منع تكرار عملي
+  // ✅ سحب سجلات بصمة حقيقية + إدخال في attendance_logs
+  // حسب بياناتك: log.id هو اللي يمثل رقم المستخدم في السجل
+  // لذلك: fpId = log.id ويطابق fingerprint_id المخزن من user.uid
   const handlePullFingerprints = async (deviceId: string) => {
     setSyncingType({ id: deviceId, type: 'fingerprints' });
 
     try {
-      // نجيب الموظفين من قاعدة البيانات
       const { data: employees, error: empErr } = await supabase
         .from('employees')
         .select('id, name, fingerprint_id');
@@ -211,17 +200,18 @@ const Devices: React.FC = () => {
 
       const result = await syncLogsFromDevice();
       const logs = result?.logs || [];
+
       if (!Array.isArray(logs) || logs.length === 0) {
         alert('⚠️ لا توجد سجلات بصمة في الجهاز.');
         return;
       }
 
-      // نحولها لسجلات حسب AttendanceRecord
       const rows: Omit<AttendanceRecord, 'id'>[] = [];
+
       for (const l of logs as any[]) {
-        const fpId = extractUserId(l);
+        const fpId = String(l?.id ?? l?.uid ?? '').trim(); // ✅ هنا المفتاح الصحيح عندك
         const emp = empByFp.get(fpId);
-        if (!emp) continue; // تجاهل سجل لا يطابق موظف عندك
+        if (!emp) continue;
 
         const dt = extractLogTimestamp(l);
         if (!dt) continue;
@@ -243,44 +233,23 @@ const Devices: React.FC = () => {
         return;
       }
 
-      // منع تكرار عملي:
-      // 1) نجمع تواريخ السجلات
-      const uniqueDates = Array.from(new Set(rows.map(r => r.date))).slice(0, 20);
-
-      // 2) نجيب الموجود في attendance_logs لهذه التواريخ فقط
-      const { data: existingLogs, error: exErr } = await supabase
-        .from('attendance_logs')
-        .select('employee_id, date, check_in')
-        .in('date', uniqueDates);
-
-      if (exErr) throw exErr;
-
-      const existingKey = new Set(
-        (existingLogs || []).map((x: any) => `${x.employee_id}__${x.date}__${x.check_in}`)
-      );
-
-      const newRows = rows.filter(r => !existingKey.has(`${r.employee_id}__${r.date}__${r.check_in}`));
-
-      if (!newRows.length) {
-        alert('✅ لا يوجد سجلات جديدة لإضافتها (كلها موجودة مسبقًا).');
-        return;
-      }
-
+      // ✅ منع تكرار رسمي: استخدم upsert على (employee_id,date,check_in)
+      // لازم تكون عامل Unique constraint في Supabase:
+      // UNIQUE (employee_id, date, check_in)
       const { error } = await supabase
         .from('attendance_logs')
-        .upsert(newRows, {
+        .upsert(rows, {
           onConflict: 'employee_id,date,check_in',
           ignoreDuplicates: true
         });
-      
-      if (error) throw error;
 
+      if (error) throw error;
 
       await supabase.from('devices')
         .update({ last_sync: new Date().toLocaleString('ar-EG') })
         .eq('id', deviceId);
 
-      alert(`✅ تم إضافة (${newRows.length}) سجل حضور جديد من الجهاز.`);
+      alert(`✅ تم تحديث سجلات الحضور (${rows.length}) من الجهاز.`);
       fetchDevices();
     } catch (err: any) {
       alert('فشل سحب البصمات: ' + err.message);
@@ -374,7 +343,9 @@ const Devices: React.FC = () => {
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
         {loading ? (
-          <div className="col-span-full py-20 text-center"><Loader2 className="animate-spin mx-auto text-blue-600" size={48} /></div>
+          <div className="col-span-full py-20 text-center">
+            <Loader2 className="animate-spin mx-auto text-blue-600" size={48} />
+          </div>
         ) : (
           devices.map((device) => (
             <div key={device.id} className="bg-white rounded-[2rem] shadow-sm border border-gray-100 overflow-hidden group hover:shadow-2xl hover:border-blue-200 transition-all duration-500">

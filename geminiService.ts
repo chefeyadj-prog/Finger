@@ -1,9 +1,13 @@
-
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import { AttendanceRecord } from "./types";
 
-// Always use const ai = new GoogleGenAI({apiKey: process.env.API_KEY});
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+
+if (!apiKey) {
+  throw new Error("Missing VITE_GEMINI_API_KEY in .env");
+}
+
+const ai = new GoogleGenAI({ apiKey });
 
 export const generateAttendanceReport = async (records: AttendanceRecord[]) => {
   const prompt = `حلل بيانات الحضور التالية وقدم تقريراً احترافياً باللغة العربية يشمل:
@@ -16,14 +20,14 @@ export const generateAttendanceReport = async (records: AttendanceRecord[]) => {
 
   try {
     const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
+      model: "gemini-3-flash-preview",
       contents: prompt,
       config: {
         temperature: 0.7,
         thinkingConfig: { thinkingBudget: 0 }
       }
     });
-    // The response.text property directly returns the string output.
+
     return response.text;
   } catch (error) {
     console.error("Error generating report:", error);

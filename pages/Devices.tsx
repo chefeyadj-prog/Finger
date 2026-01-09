@@ -266,8 +266,15 @@ const Devices: React.FC = () => {
         return;
       }
 
-      const { error } = await supabase.from('attendance_logs').insert(newRows);
+      const { error } = await supabase
+        .from('attendance_logs')
+        .upsert(newRows, {
+          onConflict: 'employee_id,date,check_in',
+          ignoreDuplicates: true
+        });
+      
       if (error) throw error;
+
 
       await supabase.from('devices')
         .update({ last_sync: new Date().toLocaleString('ar-EG') })
